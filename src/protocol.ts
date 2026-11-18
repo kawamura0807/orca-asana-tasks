@@ -2,8 +2,17 @@
 export {}
 
 declare module 'orca' {
-  /** このタスクから作った Orca ワークスペース */
-  type AsanaTaskWorkspace = { workspaceId: string | null; path: string; name: string }
+  /**
+   * このタスクから作った Orca ワークスペース。
+   * environment は作った先の Orca（'local' かペアリング済み Orca サーバーの id）。古いリンクには無い＝local。
+   */
+  type AsanaTaskWorkspace = {
+    workspaceId: string | null
+    path: string
+    name: string
+    environment?: string
+    hostName?: string
+  }
   /** パネルに出す Asana タスク1件 */
   type AsanaTask = {
     gid: string
@@ -13,7 +22,8 @@ declare module 'orca' {
     projects: string[]
     workspace: AsanaTaskWorkspace | null
   }
-  type OrcaRepo = { id: string; name: string }
+  /** ワークスペースを作れるリポジトリ。key は `${environment}::${id}` */
+  type OrcaRepo = { key: string; id: string; name: string; environment: string; hostName: string }
 
   interface PluginRequests {
     /** トークンが保存済みか、と Asana 上の自分の名前 */
@@ -23,10 +33,10 @@ declare module 'orca' {
     'asana.clearToken': { output: { ok: true } }
     /** 自分に割り当てられた未完了タスク（期限順） */
     'asana.tasks': { output: { tasks: AsanaTask[] } }
-    /** Orca に登録されているリポジトリ */
-    'orca.repos': { output: { repos: OrcaRepo[] } }
-    /** タスクからワークスペースを作り、Claude を起動する */
-    'task.start': { input: { gid: string; repoId: string }; output: AsanaTaskWorkspace }
+    /** この Mac とペアリング済み Orca サーバーに登録されているリポジトリ。unreachable は繋がらなかったサーバー名 */
+    'orca.repos': { output: { repos: OrcaRepo[]; unreachable: string[] } }
+    /** タスクからワークスペースを作り、Claude を起動する（repoKey は OrcaRepo.key） */
+    'task.start': { input: { gid: string; repoKey: string }; output: AsanaTaskWorkspace }
     /** タスクのワークスペースを Orca で開く */
     'task.open': { input: { gid: string }; output: { opened: boolean } }
     /** Asana でタスクを完了にする */

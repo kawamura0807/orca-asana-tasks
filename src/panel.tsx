@@ -28,13 +28,15 @@ type Status = { hasToken: boolean; me: string | null; error: string | null }
 const status = atom<Status | null>(null)
 const tasks = atom<AsanaTask[] | null>(null)
 const repos = atom<OrcaRepo[]>([])
+/** 繋がらなかった Orca サーバーの名前 */
+const unreachable = atom<string[]>([])
 const selected = atom<string | null>(null)
 const busy = atom<string | null>(null)
 const error = atom<string | null>(null)
 const confirmComplete = atom(false)
 const tokenDraft = atom('')
-/** 前回選んだリポジトリを覚えておく */
-const repoId = atom('repoId', '', { persist: 'plugin' })
+/** 前回選んだリポジトリ（OrcaRepo.key）を覚えておく */
+const repoKey = atom('repoKey', '', { persist: 'plugin' })
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -65,7 +67,10 @@ async function loadAll(): Promise<void> {
   if (!s.hasToken || s.error) return
   await Promise.all([
     loadTasks(),
-    plugin.request('orca.repos', undefined, { timeoutMs: 30_000 }).then((r) => set(repos, r.repos))
+    plugin.request('orca.repos', undefined, { timeoutMs: 120_000 }).then((r) => {
+      set(repos, r.repos)
+      set(unreachable, r.unreachable)
+    })
   ])
 }
 
@@ -92,7 +97,7 @@ function clearToken(): Promise<void> {
 
 function startTask(task: AsanaTask): Promise<void> {
   return run('ワークスペースを作成中', async () => {
-    await plugin.request('task.start', { gid: task.gid, repoId: read(repoId) }, { timeoutMs: 120_000 })
+    await plugin.request('task.start', { gid: task.gid, repoKey: read(repoKey) }, { timeoutMs: 120_000 })
     await loadTasks()
   })
 }
@@ -143,7 +148,7 @@ function TokenForm() {
 }
 
 function TaskActions({ task }: { task: AsanaTask }) {
-  const repoChosen = read(repoId) !== ''
+  const repoChosen = read(repos).some((r) => r.key === read(repoKey))
   const meta = [task.dueOn ? `期限 ${task.dueOn}` : '期限なし', ...task.projects].join(' ・ ')
   return (
     <Card title={task.name} description={meta}>
@@ -154,7 +159,7 @@ function TaskActions({ task }: { task: AsanaTask }) {
               ワークスペースを開く
             </Button>
             <Text muted size="xs" truncate>
-              {task.workspace.name}
+              {task.workspace.hostName ? `${task.workspace.name}（${task.workspace.hostName}）` : task.workspace.name}
             </Text>
           </Row>
         ) : (
@@ -234,10 +239,15 @@ export default function Panel() {
           <Select
             label="ワークスペースを作るリポジトリ"
             placeholder="選んでください"
-            value={read(repoId) || undefined}
-            options={read(repos).map((r) => ({ value: r.id, label: r.name }))}
-            onChange={(v) => set(repoId, v)}
+            value={read(repoKey) || undefined}
+            options={read(repos).map((r) => ({ value: r.key, label: `${r.name} — ${r.hostName}` }))}
+            onChange={(v) => set(repoKey, v)}
           />
+          {read(unreachable).length > 0 ? (
+            <Text muted size="xs">
+              {`繋がらなかった Orca: ${read(unreachable).join('、')}（そのリポジトリは一覧に出ていません）`}
+            </Text>
+          ) : null}
           {list === null ? (
             <Skeleton lines={6} label="タスクを読み込み中" />
           ) : (
