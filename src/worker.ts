@@ -118,14 +118,77 @@ function buildPrompt(task: RawTask): string {
   return lines.filter((line, i) => line !== '' || lines[i - 1] !== '').join('\n')
 }
 
-async function findWorkspaceId(orca: OrcaWorkerApi, path: string): Promise<string | null> {
+const LOCAL = 'local'
+type Environment = { id: string; name: string }
+
+/** CLI の対象 Orca を指定する引数。local（この Mac）なら何も付けない */
+function envArgs(environment: string | undefined): string[] {
+  return !environment || environment === LOCAL ? [] : ['--environment', environment]
+}
+
+/** この Mac と、ペアリング済みの Orca サーバー */
+async function listEnvironments(orca: OrcaWorkerApi): Promise<Environment[]> {
+  const targets: Environment[] = [{ id: LOCAL, name: 'この Mac' }]
+  try {
+    const out = JSON.parse(await deps.runOrca(['environment', 'list', '--json']))
+    const list: { id?: string; name?: string }[] = out?.result?.environments ?? []
+    for (const e of list) if (e.id) targets.push({ id: e.id, name: e.name || e.id })
+  } catch (error) {
+    orca.log(`environment list に失敗: ${String(error)}`)
+  }
+  return targets
+}
+
+/** OrcaRepo.key を Orca の id とリポジトリ id に分ける。区切りが無い古い値は local 扱い */
+function parseRepoKey(key: string): { environment: string; repoId: string } {
+  const at = key.indexOf('::')
+  return at < 0
+    ? { environment: LOCAL, repoId: key }
+    : { environment: key.slice(0, at), repoId: key.slice(at + 2) }
+}
+
+async function findWorkspaceId(
+  orca: OrcaWorkerApi,
+  path: string,
+  environment: string | undefined
+): Promise<string | null> {
   try {
     const { workspaces } = await orca.host.call('workspace.list')
-    return workspaces.find((w) => w.path === path)?.id ?? null
+    const remote = environment && environment !== LOCAL ? `runtime:${environment}` : null
+    const matches = workspaces.filter((w) => w.path === path)
+    return (remote ? matches.find((w) => w.hostId === remote) : null)?.id ?? matches[0]?.id ?? null
   } catch (error) {
     orca.log(`workspace.list に失敗: ${String(error)}`)
     return null
   }
+}
+
+/** リモートのリンクのうち、その Orca サーバーにもう無いワークスペースを捨てる（繋がらないサーバーのリンクは残す） */
+async function pruneRemoteLinks(orca: OrcaWorkerApi, links: Links): Promise<boolean> {
+  const envs = new Set(
+    Object.values(links)
+      .map((l) => l.environment)
+      .filter((e): e is string => !!e && e !== LOCAL)
+  )
+  let changed = false
+  for (const env of envs) {
+    let paths: Set<string>
+    try {
+      const out = JSON.parse(await deps.runOrca(['worktree', 'list', '--json', ...envArgs(env)]))
+      const list: { path?: string }[] = out?.result?.worktrees ?? []
+      paths = new Set(list.map((w) => w.path ?? ''))
+    } catch (error) {
+      orca.log(`worktree list（${env}）に失敗: ${String(error)}`)
+      continue
+    }
+    for (const [gid, link] of Object.entries(links)) {
+      if (link.environment === env && !paths.has(link.path)) {
+        delete links[gid]
+        changed = true
+      }
+    }
+  }
+  return changed
 }
 
 export default function activate(orca: OrcaWorkerApi): void {
@@ -182,25 +245,23 @@ export default function activate(orca: OrcaWorkerApi): void {
       } while (offset && raw.length < 1000)
     }
 
-    // 消えたワークスペースへのリンクは捨てる
+    // 消えたワークスペースへのリンクは捨てる（この Mac は host API、リモートは CLI で確かめる）
     const links = await readLinks(orca)
-    let live: Set<string> | null = null
+    let changed = false
     try {
       const { workspaces } = await orca.host.call('workspace.list')
-      live = new Set(workspaces.map((w) => w.path))
-    } catch (error) {
-      orca.log(`workspace.list に失敗: ${String(error)}`)
-    }
-    if (live) {
-      let changed = false
+      const live = new Set(workspaces.map((w) => w.path))
       for (const [gid, link] of Object.entries(links)) {
-        if (!live.has(link.path)) {
+        if ((!link.environment || link.environment === LOCAL) && !live.has(link.path)) {
           delete links[gid]
           changed = true
         }
       }
-      if (changed) await orca.storage.set(LINKS_KEY, links)
+    } catch (error) {
+      orca.log(`workspace.list に失敗: ${String(error)}`)
     }
+    if (await pruneRemoteLinks(orca, links)) changed = true
+    if (changed) await orca.storage.set(LINKS_KEY, links)
 
     const tasks: AsanaTask[] = raw
       .filter((t) => t.name.trim() !== '')
@@ -217,18 +278,45 @@ export default function activate(orca: OrcaWorkerApi): void {
   })
 
   orca.panels.handle('orca.repos', async () => {
-    const out = JSON.parse(await deps.runOrca(['repo', 'list', '--json']))
-    const list: { id: string; displayName?: string; path?: string }[] =
-      out?.result?.repos ?? out?.result ?? []
-    const repos: OrcaRepo[] = list
-      .map((r) => ({ id: r.id, name: r.displayName || r.path || r.id }))
-      .sort((a, b) => a.name.localeCompare(b.name))
-    return { repos }
+    const targets = await listEnvironments(orca)
+    const results = await Promise.allSettled(
+      targets.map(async (env) => {
+        const out = JSON.parse(await deps.runOrca(['repo', 'list', '--json', ...envArgs(env.id)]))
+        const list: { id: string; displayName?: string; path?: string }[] =
+          out?.result?.repos ?? out?.result ?? []
+        return list.map(
+          (r): OrcaRepo => ({
+            key: `${env.id}::${r.id}`,
+            id: r.id,
+            name: r.displayName || r.path || r.id,
+            environment: env.id,
+            hostName: env.name
+          })
+        )
+      })
+    )
+    const repos: OrcaRepo[] = []
+    const unreachable: string[] = []
+    results.forEach((result, i) => {
+      if (result.status === 'fulfilled') repos.push(...result.value)
+      else {
+        unreachable.push(targets[i].name)
+        orca.log(`repo list（${targets[i].name}）に失敗: ${String(result.reason)}`)
+      }
+    })
+    // この Mac を先頭に、Orca ごとにまとめて名前順
+    const order = new Map(targets.map((t, i) => [t.id, i]))
+    repos.sort(
+      (a, b) =>
+        (order.get(a.environment) ?? 0) - (order.get(b.environment) ?? 0) || a.name.localeCompare(b.name)
+    )
+    return { repos, unreachable }
   })
 
-  orca.panels.handle('task.start', async ({ gid, repoId }) => {
+  orca.panels.handle('task.start', async ({ gid, repoKey }) => {
     if (!/^\d+$/.test(gid)) throw fail('invalid_params', `不正なタスク gid: ${gid}`)
-    if (!repoId) throw fail('invalid_params', 'リポジトリを選んでください')
+    if (!repoKey) throw fail('invalid_params', 'リポジトリを選んでください')
+    const { environment, repoId } = parseRepoKey(repoKey)
     const links = await readLinks(orca)
     if (links[gid]) throw fail('conflict', 'このタスクのワークスペースはもうあります')
 
@@ -253,22 +341,40 @@ export default function activate(orca: OrcaWorkerApi): void {
         `Asana: ${task.permalink_url ?? gid}`,
         '--no-parent',
         '--activate',
-        '--json'
+        '--json',
+        ...envArgs(environment)
       ])
     )
     const path = findString(out?.result, 'path')
     if (!path) throw fail('action_failed', 'ワークスペースは作られましたが、パスを読み取れませんでした')
 
-    const workspaceId = await findWorkspaceId(orca, path)
+    // 名前はタスク名にする。リモートの Orca にも効くよう CLI で変える
     const name = task.name.length > 60 ? `${task.name.slice(0, 59)}…` : task.name
-    if (workspaceId) {
-      try {
-        await orca.host.call('workspace.rename', { workspaceId, name })
-      } catch (error) {
-        orca.log(`workspace.rename に失敗: ${String(error)}`)
-      }
+    try {
+      await deps.runOrca([
+        'worktree',
+        'set',
+        '--worktree',
+        `path:${path}`,
+        '--display-name',
+        name,
+        '--json',
+        ...envArgs(environment)
+      ])
+    } catch (error) {
+      orca.log(`worktree set（名前変更）に失敗: ${String(error)}`)
     }
-    const link: AsanaTaskWorkspace = { workspaceId, path, name }
+    const workspaceId = await findWorkspaceId(orca, path, environment)
+    const hostName =
+      environment === LOCAL
+        ? undefined
+        : (await listEnvironments(orca)).find((e) => e.id === environment)?.name ?? environment
+    const link: AsanaTaskWorkspace = {
+      workspaceId,
+      path,
+      name,
+      ...(environment === LOCAL ? {} : { environment, hostName })
+    }
     await orca.storage.set(LINKS_KEY, { ...links, [gid]: link })
     orca.panels.post('tasks.changed', { reason: 'start' })
     return link
@@ -277,9 +383,26 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('task.open', async ({ gid }) => {
     const link = (await readLinks(orca))[gid]
     if (!link) throw fail('invalid_params', 'このタスクのワークスペースはありません')
-    const workspaceId = link.workspaceId ?? (await findWorkspaceId(orca, link.path))
-    if (!workspaceId) throw fail('action_failed', 'ワークスペースが見つかりません')
-    await orca.host.call('workspace.open', { workspaceId })
+    const remote = !!link.environment && link.environment !== LOCAL
+    const workspaceId = link.workspaceId ?? (await findWorkspaceId(orca, link.path, link.environment))
+    if (workspaceId) {
+      try {
+        await orca.host.call('workspace.open', { workspaceId })
+        return { opened: true }
+      } catch (error) {
+        if (!remote) throw error
+        orca.log(`workspace.open に失敗、CLI で開き直す: ${String(error)}`)
+      }
+    }
+    if (!remote) throw fail('action_failed', 'ワークスペースが見つかりません')
+    await deps.runOrca([
+      'worktree',
+      'activate',
+      '--worktree',
+      `path:${link.path}`,
+      '--json',
+      ...envArgs(link.environment)
+    ])
     return { opened: true }
   })
 

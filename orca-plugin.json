@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "description": "自分に割り当てられた Asana タスクをサイドバーに並べ、タスクからワークスペースを作って Claude に着手させる。",
   "engines": {
-    "orca": ">=1.4.248"
+    "orca": ">=1.4.256"
   },
   "execution": "trusted-worker",
   "pluginApi": 1,
@@ -15,7 +15,7 @@
       {
         "id": "asana-tasks",
         "title": "Asana Tasks",
-        "icon": "check",
+        "icon": "flag",
         "entry": "src/panel.tsx",
         "ui": "components"
       }

@@ -28,7 +28,13 @@ test('タスクを選んで着手するとワークスペース作成を頼む',
     requests: {
       'asana.status': { hasToken: true, me: '山田', error: null },
       'asana.tasks': { tasks: [task] },
-      'orca.repos': { repos: [{ id: 'r1', name: 'repo-c' }] },
+      'orca.repos': {
+        repos: [
+          { key: 'local::r0', id: 'r0', name: 'orca-asana-tasks', environment: 'local', hostName: 'この Mac' },
+          { key: 'env-m::r1', id: 'r1', name: 'repo-c', environment: 'env-m', hostName: 'server-a' }
+        ],
+        unreachable: ['server-b']
+      },
       'task.start': (input) => {
         started.push(input)
         return { workspaceId: 'w', path: '/p', name: task.name }
@@ -37,10 +43,11 @@ test('タスクを選んで着手するとワークスペース作成を頼む',
   })
   const view = await mount(panel, { host })
   assert.ok(view.find({ text: 'Asana: 山田' }))
-  await view.select({ label: 'ワークスペースを作るリポジトリ' }, 'r1')
+  assert.ok(view.find({ text: '繋がらなかった Orca: server-b（そのリポジトリは一覧に出ていません）' }))
+  await view.select({ label: 'ワークスペースを作るリポジトリ' }, 'env-m::r1')
   await view.selectRows({ label: '自分のタスク' }, ['10'])
   await view.press({ text: '着手（ワークスペース作成＋Claude）' })
-  assert.deepEqual(started, [{ gid: '10', repoId: 'r1' }])
+  assert.deepEqual(started, [{ gid: '10', repoKey: 'env-m::r1' }])
   assert.deepEqual(view.errors, [])
   assert.deepEqual(view.refusals, [])
   await view.unmount()

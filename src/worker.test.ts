@@ -76,6 +76,108 @@ test('タスクを期限順に並べ、消えたワークスペースのリン�
   await worker.deactivate()
 })
 
+test('この Mac と各 Orca サーバーのリポジトリを集め、繋がらないサーバーを報告する', async () => {
+  main.deps.runOrca = async (args) => {
+    if (args[0] === 'environment') {
+      return JSON.stringify({
+        ok: true,
+        result: { environments: [{ id: 'env-m', name: 'server-a' }, { id: 'env-h', name: 'server-b' }] }
+      })
+    }
+    const env = args.includes('--environment') ? args[args.indexOf('--environment') + 1] : 'local'
+    if (env === 'env-h') throw new Error('接続できません')
+    const names = env === 'local' ? ['orca-asana-tasks'] : ['repo-b', 'repo-a']
+    return JSON.stringify({
+      ok: true,
+      result: { repos: names.map((n) => ({ id: `${env}-${n}`, displayName: n })) }
+    })
+  }
+  const worker = await mountWorker(main, { host: mockHost() })
+  const { repos, unreachable } = await worker.request('orca.repos')
+  assert.deepEqual(
+    repos.map((r) => [r.key, r.name, r.hostName]),
+    [
+      ['local::local-orca-asana-tasks', 'orca-asana-tasks', 'この Mac'],
+      ['env-m::env-m-repo-a', 'repo-a', 'server-a'],
+      ['env-m::env-m-repo-b', 'repo-b', 'server-a']
+    ]
+  )
+  assert.deepEqual(unreachable, ['server-b'])
+  await worker.deactivate()
+})
+
+test('リモートの Orca サーバーに着手すると --environment 付きで作り、リンクにサーバーを残す', async () => {
+  fakeAsana(
+    { 'GET /tasks/77': { data: { gid: '77', name: 'PBX の設定', notes: '', permalink_url: 'https://app.asana.com/y' } } },
+    []
+  )
+  const cli: string[][] = []
+  main.deps.runOrca = async (args) => {
+    cli.push(args)
+    if (args[0] === 'environment') {
+      return JSON.stringify({ ok: true, result: { environments: [{ id: 'env-m', name: 'server-a' }] } })
+    }
+    if (args[1] === 'create') return JSON.stringify({ ok: true, result: { worktree: { path: '/remote/ws' } } })
+    if (args[1] === 'list') return JSON.stringify({ ok: true, result: { worktrees: [] } })
+    return JSON.stringify({ ok: true, result: {} })
+  }
+  const host = mockHost({
+    secrets: { asanaToken: 't' },
+    results: { 'workspace.list': { workspaces: [], truncated: false } }
+  })
+  const worker = await mountWorker(main, { host })
+  const link = await worker.request('task.start', { gid: '77', repoKey: 'env-m::repo-9' })
+  assert.deepEqual(link, {
+    workspaceId: null,
+    path: '/remote/ws',
+    name: 'PBX の設定',
+    environment: 'env-m',
+    hostName: 'server-a'
+  })
+  const create = cli.find((a) => a[1] === 'create')!
+  assert.deepEqual(create.slice(0, 4), ['worktree', 'create', '--repo', 'id:repo-9'])
+  assert.deepEqual(create.slice(-2), ['--environment', 'env-m'])
+  const rename = cli.find((a) => a[1] === 'set')!
+  assert.deepEqual(rename, [
+    'worktree', 'set', '--worktree', 'path:/remote/ws', '--display-name', 'PBX の設定', '--json', '--environment', 'env-m'
+  ])
+
+  // 開くときは host API で見つからないので CLI の activate に回す
+  assert.deepEqual(await worker.request('task.open', { gid: '77' }), { opened: true })
+  assert.deepEqual(cli.at(-1), ['worktree', 'activate', '--worktree', 'path:/remote/ws', '--json', '--environment', 'env-m'])
+  await worker.deactivate()
+})
+
+test('リモートのリンクは、そのサーバーに無ければ捨て、繋がらなければ残す', async () => {
+  fakeAsana(
+    {
+      'GET /users/me': { data: { workspaces: [{ gid: '1' }] } },
+      'GET /tasks?': { data: [], next_page: null }
+    },
+    []
+  )
+  main.deps.runOrca = async (args) => {
+    const env = args[args.indexOf('--environment') + 1]
+    if (env === 'env-h') throw new Error('接続できません')
+    return JSON.stringify({ ok: true, result: { worktrees: [{ path: '/m/alive' }] } })
+  }
+  const host = mockHost({
+    secrets: { asanaToken: 't' },
+    storage: {
+      links: {
+        '1': { workspaceId: null, path: '/m/alive', name: 'a', environment: 'env-m' },
+        '2': { workspaceId: null, path: '/m/gone', name: 'b', environment: 'env-m' },
+        '3': { workspaceId: null, path: '/h/x', name: 'c', environment: 'env-h' }
+      }
+    },
+    results: { 'workspace.list': { workspaces: [], truncated: false } }
+  })
+  const worker = await mountWorker(main, { host })
+  await worker.request('asana.tasks')
+  assert.deepEqual(Object.keys(host.data().storage.links as object).sort(), ['1', '3'])
+  await worker.deactivate()
+})
+
 test('着手するとワークスペースを作り、名前をタスク名にしてリンクを残す', async () => {
   const calls: Call[] = []
   fakeAsana(
@@ -97,19 +199,20 @@ test('着手するとワークスペースを作り、名前をタスク名に�
       'workspace.list': {
         workspaces: [{ id: 'w-new', kind: 'worktree', name: 'asana-123', path: '/ws/new', branch: 'x', hostId: 'local' }],
         truncated: false
-      },
-      'workspace.rename': ({ name }: { name: string }) => ({ name })
+      }
     }
   })
   const worker = await mountWorker(main, { host })
-  const link = await worker.request('task.start', { gid: '123', repoId: 'repo-1' })
+  // 区切りの無い古い値は この Mac のリポジトリとして扱う
+  const link = await worker.request('task.start', { gid: '123', repoKey: 'repo-1' })
   assert.deepEqual(link, { workspaceId: 'w-new', path: '/ws/new', name: '請求書の確認' })
   const args = cli[0]
   assert.deepEqual(args.slice(0, 4), ['worktree', 'create', '--repo', 'id:repo-1'])
+  assert.equal(args.includes('--environment'), false)
   assert.equal(args[args.indexOf('--agent') + 1], 'claude')
   assert.equal(args[args.indexOf('--prompt') + 1].includes('https://app.asana.com/x'), true)
-  assert.deepEqual(host.callsOf('workspace.rename'), [{ workspaceId: 'w-new', name: '請求書の確認' }])
-  await assert.rejects(worker.request('task.start', { gid: '123', repoId: 'repo-1' }))
+  assert.deepEqual(cli[1], ['worktree', 'set', '--worktree', 'path:/ws/new', '--display-name', '請求書の確認', '--json'])
+  await assert.rejects(worker.request('task.start', { gid: '123', repoKey: 'local::repo-1' }))
   assert.deepEqual(worker.refusals, [])
   await worker.deactivate()
 })
