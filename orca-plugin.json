@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "asana-tasks",
   "name": "Asana Tasks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "自分に割り当てられた Asana タスクをサイドバーに並べ、タスクからワークスペースを作って Claude に着手させる。",
   "engines": {
     "orca": ">=1.4.256"
